@@ -9,6 +9,7 @@ AD privilege-escalation toolkit combining bloodyAD LDAP primitives with aclpwn-s
 - adpwn_tools.py -- Core async wrappers around the adpwn Python API. LDAP manipulation and restore journaling.
 - bloodyad_tool.py -- Subprocess wrappers around the bloodyAD CLI for enumeration.
 - autobloody_tool.py -- Wrapper around autobloody for graph-driven ACL path exploitation via BloodHound and Neo4j.
+- adpwn_cli.py -- Argparse CLI for standalone use; wraps all 9 primitives.
 
 ---
 
